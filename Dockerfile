@@ -25,13 +25,13 @@ FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
 
 # Security: Create non-root user and group
-RUN addgroup -S daonbmgroup && adduser -S daonbm -G daonbmgroup
+RUN addgroup -S duonggroup && adduser -S duong -G duonggroup
 
 # Copy built JAR from builder stage and assign ownership
-COPY --from=builder --chown=daonbm:daonbmgroup /app/build/libs/*.jar app.jar
+COPY --from=builder --chown=duong:duonggroup /app/build/libs/*.jar app.jar
 
 # Switch to non-root user
-USER daonbm
+USER duong
 
 # Expose application port
 EXPOSE 8083
