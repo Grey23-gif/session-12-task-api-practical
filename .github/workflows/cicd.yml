@@ -1,134 +1,84 @@
+
 name: CI/CD
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [main]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
 
 jobs:
-  build:
+  build-and-test:
+    name: CI - Build and Test
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up JDK 21
+      - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '21'
-          distribution: 'temurin'
-          cache: 'gradle'
+          cache: gradle
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
+      - name: Grant Gradle permission
+        run: chmod +x ./gradlew
 
-      - name: Build with Gradle
-        run: ./gradlew build -x test
-
-  test:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-          cache: 'gradle'
-
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
-
-      - name: Run Tests with Gradle
-        run: ./gradlew test
-
-  build-and-push-image:
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'push'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_PAT }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ secrets.DOCKER_USER }}/task-app:latest
-            ${{ secrets.DOCKER_USER }}/task-app:${{ github.sha }}
+      - name: Build and Test
+        run: ./gradlew clean build --no-daemon
 
   deploy:
+    name: CD - Deploy to VPS
+    needs: build-and-test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    needs: build-and-push-image
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/lesson-02')
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Copy deployment files to Server
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: ${{ secrets.SERVER_PORT }}
-          source: "docker-compose.yml,src/main/resources/db/taskdb.sql"
-          target: "app"
-
-      - name: Deploy via Docker Compose SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Configure SSH
         env:
-          DB_NAME: ${{ secrets.DB_NAME }}
-          DB_URL: ${{ secrets.DB_URL }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASS: ${{ secrets.DB_PASS }}
-          DB_PORT: ${{ secrets.DB_PORT }}
-          DOCKER_USER: ${{ secrets.DOCKER_USER }}
-          DOCKER_PAT: ${{ secrets.DOCKER_PAT }}
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: ${{ secrets.SERVER_PORT }}
-          envs: DB_NAME,DB_URL,DB_USER,DB_PASS,DB_PORT,DOCKER_USER,DOCKER_PAT
-          script: |
-            echo "Logging into Docker Hub..."
-            echo "$DOCKER_PAT" | docker login -u "$DOCKER_USER" --password-stdin
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_HOST_KEY: ${{ secrets.VPS_HOST_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
 
-            cd ~/app
+      - name: Deploy to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$VPS_USER@$VPS_HOST" 'bash -se' <<'EOF'
+          set -euo pipefail
 
-            echo "Generating .env file..."
-            cat << EOF > .env
-            DB_NAME=$DB_NAME
-            DB_URL=$DB_URL
-            DB_USER=$DB_USER
-            DB_PASS=$DB_PASS
-            DB_PORT=${DB_PORT:-3306}
-            APP_IMAGE=$DOCKER_USER/task-app:latest
-            EOF
+          cd /opt/duongapp/session-12-task-api-practical
 
-            echo "Stopping old containers..."
-            docker compose down --remove-orphans
+          echo "Pulling latest code..."
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
 
-            echo "Pulling latest Docker image..."
-            docker compose pull
+          echo "Checking configuration..."
+          test -f .env
+          docker compose config --quiet
 
-            echo "Deploying application using Docker Compose..."
-            docker compose up -d --remove-orphans
+          echo "Building and deploying..."
+          docker compose up -d --build --wait --wait-timeout 180
 
-            echo "Deployment completed successfully."
+          echo "Container status:"
+          docker compose ps
+          EOF
