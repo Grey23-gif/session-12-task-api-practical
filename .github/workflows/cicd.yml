@@ -16,30 +16,80 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-test:
-    name: CI - Build and Test
+  build:
+    name: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Java 21
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
           cache: gradle
 
-      - name: Grant Gradle permission
-        run: chmod +x ./gradlew
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assemble --no-daemon
 
-      - name: Build and Test
-        run: ./gradlew clean build --no-daemon
+  test:
+    name: test
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Test
+        run: |
+          chmod +x gradlew
+          ./gradlew test --no-daemon
+
+  build-and-push-image:
+    name: build-and-push-image
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          IMAGE="ghcr.io/${REPOSITORY,,}"
+
+          docker build \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:sha-$SHA" .
+
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:sha-$SHA"
 
   deploy:
-    name: CD - Deploy to VPS
-    needs: build-and-test
+    name: deploy
+    needs: build-and-push-image
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
@@ -51,34 +101,55 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+
           printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null
 
       - name: Deploy to VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
+          IMAGE="ghcr.io/${REPOSITORY,,}:sha-$SHA"
+
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            "$VPS_USER@$VPS_HOST" 'bash -se' <<'EOF'
+            "$VPS_USER@$VPS_HOST" \
+            "APP_IMAGE='$IMAGE' bash -se" <<'EOF'
           set -euo pipefail
 
           cd /opt/duongapp/session-12-task-api-practical
 
-          echo "Pulling latest code..."
           git fetch origin main
           git checkout main
           git reset --hard origin/main
 
-          echo "Checking configuration..."
           test -f .env
+
+          echo "Pulling image..."
+          docker pull "$APP_IMAGE"
+
+          echo "Deploying..."
+          export APP_IMAGE
           docker compose config --quiet
+          docker compose up -d --no-build --wait --wait-timeout 180
 
-          echo "Building and deploying..."
-          docker compose up -d --build --wait --wait-timeout 180
+          echo "Checking API..."
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8083/api/tasks >/dev/null; then
+              echo "API is healthy"
+              exit 0
+            fi
+            sleep 5
+          done
 
-          echo "Container status:"
           docker compose ps
+          docker logs --tail 80 task-app
+          exit 1
           EOF
